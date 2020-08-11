@@ -1,0 +1,116 @@
+setwd("/Users/suifangmao/Chapter 9")
+# Seurat for datasets with more than 5000 cells
+library(Seurat)
+library(dplyr)
+library(cowplot)
+
+## 9.1 set up Seurat Object
+# Load the PBMC dataset (note: 	Directory containing the matrix.mtx, genes.tsv (or features.tsv), barcodes.tsv)
+pbmc.data <- Read10X(data.dir = "data/pbmc3k_filtered_gene_bc_matrices/hg19/")
+# Initialize the Seurat object with the raw (non-normalized data).  Keep all
+# genes expressed in >= 3 cells (~0.1% of the data). Keep all cells with at
+# least 200 detected genes
+# Note: CreateSeuratObject()
+pbmc<-CreateSeuratObject(counts=pbmc.data, min.cells = 3, min.features = 200, project = "10X_PBMC", assay = "RNA")
+
+## 9.3 QC and selecting cells for further analysis
+# 3+1 parameter: nGene, nUMI and % MT, % UMI mapping to %MT
+# (1) % MT genes
+mito.genes <- grep(pattern = "^MT-", x = rownames(pbmc@assays[["RNA"]]), value = TRUE)
+percent.mito <- Matrix::colSums(pbmc@assays[["RNA"]][mito.genes, ])/Matrix::colSums(pbmc@assays[["RNA"]])
+# AddMetaData adds columns to object@meta.data, and is a great place to stash QC stats
+pbmc<-AddMetaData(object = pbmc, metadata = percent.mito, col.name ="percent.mito")
+# (2) to look at MetaData by using pbmc$nFeature_RNA, or $nCount_RNA, $percent.mito)
+VlnPlot(object = pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 3)
+# (3) GenePlot
+par(mfrow = c(1, 2))
+FeatureScatter(object = pbmc, feature1 = "nCount_RNA", feature2 = "percent.mito")
+FeatureScatter(object = pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+# quantile(pbmc$nFeature_RNA,)
+# 0%  25%  50%  75% 100% 
+# 212  690  816  952 3400 
+# (4) subset(): Cell QC by threshold unique gene # over 2,500 or less than 200; %MT (-Inf and Inf: don't want a lower or upper threshold)
+pbmc <- subset(x = pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+# now cells are reduced from 2700 to 2638.
+
+## 9.4 Normalizing the data
+# “LogNormalize” that normalizes the gene expression measurements for each cell 
+#  by the total expression, multiplies this by a scale factor (10,000 by default)
+
+pbmc <- NormalizeData(object = pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+
+## 9.5 Detection of variable genes across the single cells
+
+# FindVariableGenes(): calculates the average expression and dispersion for each gene, places these genes into bins, 
+# and then calculates a z-score for dispersion within each bin
+pbmc <- FindVariableFeatures(object = pbmc, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, nfeatures = 2000)
+# HVG not to be stored in the Seurat object
+head(x = HVFInfo(object = pbmc))
+# identify ~2,000 variable genes
+
+## 9.6 Scaling the data and removing unwanted sources of variation
+
+# Seurat constructs linear models to predict gene expression based on user-defined variables. 
+# The scaled z-scored residuals of these models are stored in the scale.data slot, and are used for dimensionality reduction and clustering
+# regress out cell-cell variation in gene expression driven by batch (if applicable), cell alignment rate (as provided by Drop-seq tools for Drop-seq data)
+# the number of detected molecules, and mitochondrial gene expression.
+
+pbmc <- ScaleData(object = pbmc, vars.to.regress = c("nCounts_RNA", "percent.mito"))
+
+## 9.7 Perform linear dimensional reduction
+
+# running dimensionality reduction on highly variable genes can improve performance
+pbmc <- RunPCA(object = pbmc,  npcs = 30, verbose = FALSE)
+# add 1 dimensional reduction calculated: pca
+
+## 9.8 Determine statistically significant principal components
+## Key note: PCs determination (or true dimensionality of a dataset) is the key for Serurat in downstream analysis
+
+# (1) Determine significant PCs
+# JackStraw(): resampling test inspired by the jackStraw
+# permute a subset of the data (1% by default) and rerun PCA, 
+# constructing a ‘null distribution’ of gene scores, and repeat this procedure
+# enrich PCs with low p Values
+
+pbmc <- JackStraw(object = pbmc, reduction = "pca", dims = 20, num.replicate = 100,  prop.freq = 0.1, verbose = FALSE)
+pbmc <- ScoreJackStraw(object = pbmc, dims = 1:20, reduction = "pca")
+JackStrawPlot(object = pbmc, dims = 1:20, reduction = "pca")
+
+# (2) Determine the cutoffs of PCs 
+#  ElbowPlot(): a plot of the standard deviations of the principle components and draw your cutoff
+ElbowPlot(object = pbmc)
+
+## 9.9 Cluster the cells
+# (1) Construct a K-nearest neighbor (KNN) graph and the SNN graph from PCA: edges drawn between cells with similar gene expression patterns,
+# FindNeighbors()function:
+
+pbmc <- FindNeighbors(pbmc, reduction = "pca", dims = 1:20)
+
+# (2) Refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity)
+# (3) Louvain algorithm (default) or SLM to iteratively group cells together, with the goal of optimizing the standard modularity function
+# FincClusters(): contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, 0.6-1.2 is ideal
+
+pbmc <- FindClusters(pbmc, resolution = 0.5, algorithm = 1)
+
+# Number of nodes: 2638
+# Number of edges: 124363
+#Maximum modularity in 10 random starts: 0.8589
+#Number of communities: 8
+
+# The clusuter is stored in metadata under "seurat_clusters" 
+pbmc$seurat_clusters
+
+pbmc <- FindClusters(pbmc, resolution = 0.5, algorithm = 1)
+## 9.10 Run Non-linear dimensional reduction (tSNE)
+
+pbmc <- RunTSNE(object = pbmc, dims.use = 1:10, do.fast = TRUE)
+DimPlot(object = pbmc, reduction = "tsne", label = TRUE)
+DimPlot(object = pbmc, reduction = "tsne", split.by = "seurat_clusters", label = TRUE)
+## 9.11 Run UMAP
+
+pbmc <- RunUMAP(pbmc, reduction = "pca", dims = 1:20)
+DimPlot(pbmc, reduction = "umap", split.by = "seurat_clusters")
+DimPlot(pbmc, reduction = "umap", label=TRUE)
+
+### save data ###
+saveRDS(pbmc, file = "data/pbmc_tutorial.rds")
